@@ -1,0 +1,419 @@
+import random
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from training_text import TRAINING_TEXT
+
+
+# ============================================================
+# 1. YOUR TRAINING TEXT
+# ============================================================
+# Edit `training_text.py` to change the corpus used by the model.
+
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+# ============================================================
+# 2. CONFIG
+# ============================================================
+@dataclass
+class Config:
+    batch_size: int = 16
+    block_size: int = 48          # how many characters the model can look at once
+    max_steps: int = 800
+    eval_interval: int = 100
+    learning_rate: float = 3e-3
+
+    n_embed: int = 64
+    n_heads: int = 4
+    n_layers: int = 2
+    dropout: float = 0.1
+
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+cfg = Config()
+
+
+# ============================================================
+# 3. TOKENIZER (character-level)
+# ============================================================
+text = TRAINING_TEXT
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for ch, i in stoi.items()}
+
+def encode(s: str):
+    unknown_chars = sorted(set(s) - set(stoi))
+    if unknown_chars:
+        shown = ", ".join(repr(ch) for ch in unknown_chars)
+        raise ValueError(f"Prompt contains characters outside the training text: {shown}")
+    return [stoi[c] for c in s]
+
+def decode(ids):
+    return "".join(itos[i] for i in ids)
+
+data = torch.tensor(encode(text), dtype=torch.long)
+
+
+def prepare_splits(full_data: torch.Tensor):
+    if len(full_data) < 4:
+        raise ValueError("Training text is too short. Add a few more characters to study the model.")
+
+    # Keep the educational config, but shrink block size when the corpus is tiny.
+    max_supported_block = max(1, (len(full_data) - 2) // 2)
+    if cfg.block_size > max_supported_block:
+        print(
+            f"Requested block_size={cfg.block_size} is too large for this corpus, "
+            f"so it was reduced to {max_supported_block}."
+        )
+        cfg.block_size = max_supported_block
+
+    min_split_size = cfg.block_size + 1
+    proposed_train_size = int(0.9 * len(full_data))
+    train_size = min(max(proposed_train_size, min_split_size), len(full_data) - min_split_size)
+
+    train_split = full_data[:train_size]
+    val_split = full_data[train_size:]
+    return train_split, val_split
+
+
+train_data, val_data = prepare_splits(data)
+
+
+# ============================================================
+# 4. DATA BATCHES
+# ============================================================
+def get_batch(split: str):
+    if split not in {"train", "val"}:
+        raise ValueError("split must be 'train' or 'val'.")
+
+    source = train_data if split == "train" else val_data
+    max_start = len(source) - cfg.block_size - 1
+    ix = torch.randint(0, max_start + 1, (cfg.batch_size,))
+    x = torch.stack([source[i:i + cfg.block_size] for i in ix])
+    y = torch.stack([source[i + 1:i + cfg.block_size + 1] for i in ix])
+    return x.to(cfg.device), y.to(cfg.device)
+
+
+# ============================================================
+# 5. TRANSFORMER PARTS
+# ============================================================
+class Head(nn.Module):
+    def __init__(self, head_size: int):
+        super().__init__()
+        self.key = nn.Linear(cfg.n_embed, head_size, bias=False)
+        self.query = nn.Linear(cfg.n_embed, head_size, bias=False)
+        self.value = nn.Linear(cfg.n_embed, head_size, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(cfg.block_size, cfg.block_size))
+        )
+
+        self.last_attention = None
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)    # (B, T, head_size)
+        q = self.query(x)  # (B, T, head_size)
+
+        wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)  # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        wei = F.softmax(wei, dim=-1)
+        self.last_attention = wei.detach().cpu()
+        wei = self.dropout(wei)
+
+        v = self.value(x)
+        out = wei @ v
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads: int, head_size: int):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(cfg.n_embed, cfg.n_embed)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cfg.n_embed, 4 * cfg.n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * cfg.n_embed, cfg.n_embed),
+            nn.Dropout(cfg.dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        head_size = cfg.n_embed // cfg.n_heads
+        self.sa = MultiHeadAttention(cfg.n_heads, head_size)
+        self.ffwd = FeedForward()
+        self.ln1 = nn.LayerNorm(cfg.n_embed)
+        self.ln2 = nn.LayerNorm(cfg.n_embed)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+class TinyTransformerLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, cfg.n_embed)
+        self.position_embedding_table = nn.Embedding(cfg.block_size, cfg.n_embed)
+        self.blocks = nn.Sequential(*[Block() for _ in range(cfg.n_layers)])
+        self.ln_f = nn.LayerNorm(cfg.n_embed)
+        self.lm_head = nn.Linear(cfg.n_embed, vocab_size)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+
+        tok_emb = self.token_embedding_table(idx)  # (B, T, C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=cfg.device))  # (T, C)
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
+        loss = None
+        if targets is not None:
+            B, T, C = logits.shape
+            logits_flat = logits.view(B * T, C)
+            targets_flat = targets.view(B * T)
+            loss = F.cross_entropy(logits_flat, targets_flat)
+
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens: int):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -cfg.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]  # last time step
+            probs = F.softmax(logits, dim=-1)
+            next_idx = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, next_idx), dim=1)
+        return idx
+
+
+model = TinyTransformerLM().to(cfg.device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
+
+
+# ============================================================
+# 6. EVALUATION
+# ============================================================
+@torch.no_grad()
+def estimate_loss():
+    model.eval()
+    out = {}
+    for split in ["train", "val"]:
+        losses = torch.zeros(20)
+        for k in range(20):
+            xb, yb = get_batch(split)
+            _, loss = model(xb, yb)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+
+# ============================================================
+# 7. VISUAL DEBUG: NEXT-CHAR PROBABILITIES
+# ============================================================
+@torch.no_grad()
+def debug_next_char(prompt: str, top_k: int = 10, plot: bool = True):
+    model.eval()
+
+    prompt_ids = encode(prompt)
+    if len(prompt_ids) == 0:
+        raise ValueError("Prompt cannot be empty.")
+
+    idx = torch.tensor([prompt_ids], dtype=torch.long, device=cfg.device)
+    idx_cond = idx[:, -cfg.block_size:]
+
+    logits, _ = model(idx_cond)
+    last_logits = logits[0, -1]
+    probs = F.softmax(last_logits, dim=-1).detach().cpu()
+
+    top_probs, top_idx = torch.topk(probs, k=min(top_k, vocab_size))
+
+    print("\n" + "=" * 60)
+    print(f"PROMPT: {repr(prompt)}")
+    print("Top next-character predictions:")
+    for rank, (p, i) in enumerate(zip(top_probs.tolist(), top_idx.tolist()), start=1):
+        ch = itos[i]
+        shown = "\\n" if ch == "\n" else ch
+        print(f"{rank:2d}. {repr(shown):>6} -> {p * 100:6.2f}%")
+    print("=" * 60)
+
+    if plot:
+        labels = []
+        values = []
+        for p, i in zip(top_probs.tolist(), top_idx.tolist()):
+            ch = itos[i]
+            labels.append("\\n" if ch == "\n" else ch)
+            values.append(p * 100)
+
+        plt.figure(figsize=(10, 4))
+        plt.bar(labels, values)
+        plt.title(f"Next-character probabilities for prompt: {repr(prompt)}")
+        plt.xlabel("Character")
+        plt.ylabel("Probability (%)")
+        plt.tight_layout()
+        plt.show()
+
+    model.train()
+
+
+# ============================================================
+# 8. VISUAL DEBUG: ATTENTION HEATMAP
+# ============================================================
+@torch.no_grad()
+def show_attention(prompt: str, layer_index: int = 0, head_index: int = 0):
+    model.eval()
+
+    prompt_ids = encode(prompt)
+    if len(prompt_ids) == 0:
+        raise ValueError("Prompt cannot be empty.")
+    if not 0 <= layer_index < len(model.blocks):
+        raise ValueError(f"layer_index must be between 0 and {len(model.blocks) - 1}.")
+
+    block = model.blocks[layer_index]
+    if not 0 <= head_index < len(block.sa.heads):
+        raise ValueError(f"head_index must be between 0 and {len(block.sa.heads) - 1}.")
+
+    idx = torch.tensor([prompt_ids[-cfg.block_size:]], dtype=torch.long, device=cfg.device)
+    _logits, _ = model(idx)
+
+    attn = block.sa.heads[head_index].last_attention  # shape: (B, T, T)
+    if attn is None:
+        print("No attention saved.")
+        return
+
+    attn = attn[0].numpy()
+    chars_in_prompt = list(prompt[-attn.shape[0]:])
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(attn)
+    plt.colorbar()
+    plt.title(f"Attention heatmap - layer {layer_index}, head {head_index}")
+    plt.xticks(range(len(chars_in_prompt)), chars_in_prompt)
+    plt.yticks(range(len(chars_in_prompt)), chars_in_prompt)
+    plt.xlabel("Looks at")
+    plt.ylabel("Current position")
+    plt.tight_layout()
+    plt.show()
+
+    model.train()
+
+
+def run_training():
+    train_losses = []
+    val_losses = []
+    steps_seen = []
+
+    print(f"Device: {cfg.device}")
+    print(f"Vocabulary size: {vocab_size}")
+    print(f"Characters: {chars}")
+    print(f"Using block size: {cfg.block_size}")
+    print(f"Train tokens: {len(train_data)} | Val tokens: {len(val_data)}")
+
+    for step in range(cfg.max_steps):
+        xb, yb = get_batch("train")
+        logits, loss = model(xb, yb)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % cfg.eval_interval == 0 or step == cfg.max_steps - 1:
+            losses = estimate_loss()
+            steps_seen.append(step)
+            train_losses.append(losses["train"])
+            val_losses.append(losses["val"])
+
+            print(
+                f"step {step:4d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f}"
+            )
+
+            # Show how the model currently thinks.
+            debug_prompt = "hello" if all(ch in stoi for ch in "hello") else text[: min(5, len(text))]
+            debug_next_char(debug_prompt, top_k=8, plot=False)
+
+    return steps_seen, train_losses, val_losses
+
+
+def plot_losses(steps_seen, train_losses, val_losses):
+    plt.figure(figsize=(8, 4))
+    plt.plot(steps_seen, train_losses, label="train loss")
+    plt.plot(steps_seen, val_losses, label="val loss")
+    plt.title("Training loss")
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def show_final_examples():
+    start_char = "h" if "h" in stoi else chars[0]
+    context = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=cfg.device)
+    generated = model.generate(context, max_new_tokens=200)[0].tolist()
+
+    print("\n" + "#" * 60)
+    print("GENERATED TEXT")
+    print("#" * 60)
+    print(decode(generated))
+
+    if all(ch in stoi for ch in "hello"):
+        debug_next_char("hello", top_k=10, plot=True)
+    if all(ch in stoi for ch in "transform"):
+        debug_next_char("transform", top_k=10, plot=True)
+    if all(ch in stoi for ch in "hello there."):
+        show_attention("hello there.", layer_index=0, head_index=0)
+
+
+def main():
+    steps_seen, train_losses, val_losses = run_training()
+    plot_losses(steps_seen, train_losses, val_losses)
+    show_final_examples()
+
+
+if __name__ == "__main__":
+    main()
