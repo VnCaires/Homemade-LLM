@@ -1,3 +1,4 @@
+import argparse
 import random
 from dataclasses import dataclass
 
@@ -233,6 +234,71 @@ model = TinyTransformerLM().to(cfg.device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
 
+def choose_known_prompt(preferred: str = "hello"):
+    if preferred and all(ch in stoi for ch in preferred):
+        return preferred
+    return text[: min(5, len(text))]
+
+
+def print_tensor_shape(name: str, tensor: torch.Tensor):
+    print(f"{name:<28} shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}")
+
+
+def printable_char_list():
+    return [ch.encode("unicode_escape").decode("ascii") for ch in chars]
+
+
+def printable_char(ch: str):
+    return ch.encode("unicode_escape").decode("ascii")
+
+
+def printable_text(text_value: str):
+    return text_value.encode("unicode_escape").decode("ascii")
+
+
+@torch.no_grad()
+def sanity_check(prompt: str = "hello"):
+    print("\n" + "=" * 60)
+    print("SANITY CHECK: one forward-pass walkthrough")
+    print("=" * 60)
+
+    xb, yb = get_batch("train")
+    print_tensor_shape("input batch xb", xb)
+    print_tensor_shape("target batch yb", yb)
+
+    idx = xb[:1]
+    print_tensor_shape("single example idx", idx)
+
+    tok_emb = model.token_embedding_table(idx)
+    pos_idx = torch.arange(idx.shape[1], device=cfg.device)
+    pos_emb = model.position_embedding_table(pos_idx)
+    print_tensor_shape("token embeddings", tok_emb)
+    print_tensor_shape("position indices", pos_idx)
+    print_tensor_shape("position embeddings", pos_emb)
+
+    x = tok_emb + pos_emb
+    print_tensor_shape("embedding sum", x)
+
+    first_block = model.blocks[0]
+    ln1_out = first_block.ln1(x)
+    print_tensor_shape("after layer norm 1", ln1_out)
+
+    first_head = first_block.sa.heads[0]
+    head_out = first_head(ln1_out)
+    print_tensor_shape("first attention head out", head_out)
+    if first_head.last_attention is not None:
+        print_tensor_shape("saved attention matrix", first_head.last_attention)
+
+    logits, loss = model(xb, yb)
+    print_tensor_shape("model logits", logits)
+    if loss is not None:
+        print(f"example loss value           {loss.item():.4f}")
+
+    safe_prompt = choose_known_prompt(prompt)
+    print(f"debug prompt used            {repr(safe_prompt)}")
+    debug_next_char(safe_prompt, top_k=8, plot=False)
+
+
 # ============================================================
 # 6. EVALUATION
 # ============================================================
@@ -276,7 +342,7 @@ def debug_next_char(prompt: str, top_k: int = 10, plot: bool = True):
     print("Top next-character predictions:")
     for rank, (p, i) in enumerate(zip(top_probs.tolist(), top_idx.tolist()), start=1):
         ch = itos[i]
-        shown = "\\n" if ch == "\n" else ch
+        shown = "\\n" if ch == "\n" else printable_char(ch)
         print(f"{rank:2d}. {repr(shown):>6} -> {p * 100:6.2f}%")
     print("=" * 60)
 
@@ -285,7 +351,7 @@ def debug_next_char(prompt: str, top_k: int = 10, plot: bool = True):
         values = []
         for p, i in zip(top_probs.tolist(), top_idx.tolist()):
             ch = itos[i]
-            labels.append("\\n" if ch == "\n" else ch)
+            labels.append("\\n" if ch == "\n" else printable_char(ch))
             values.append(p * 100)
 
         plt.figure(figsize=(10, 4))
@@ -341,18 +407,23 @@ def show_attention(prompt: str, layer_index: int = 0, head_index: int = 0):
     model.train()
 
 
-def run_training():
+def run_training(max_steps: int | None = None, debug_shapes: bool = False):
     train_losses = []
     val_losses = []
     steps_seen = []
+    total_steps = cfg.max_steps if max_steps is None else max_steps
 
     print(f"Device: {cfg.device}")
     print(f"Vocabulary size: {vocab_size}")
-    print(f"Characters: {chars}")
+    print(f"Characters: {printable_char_list()}")
     print(f"Using block size: {cfg.block_size}")
     print(f"Train tokens: {len(train_data)} | Val tokens: {len(val_data)}")
+    print(f"Training steps: {total_steps}")
 
-    for step in range(cfg.max_steps):
+    if debug_shapes:
+        sanity_check()
+
+    for step in range(total_steps):
         xb, yb = get_batch("train")
         logits, loss = model(xb, yb)
 
@@ -360,7 +431,7 @@ def run_training():
         loss.backward()
         optimizer.step()
 
-        if step % cfg.eval_interval == 0 or step == cfg.max_steps - 1:
+        if step % cfg.eval_interval == 0 or step == total_steps - 1:
             losses = estimate_loss()
             steps_seen.append(step)
             train_losses.append(losses["train"])
@@ -373,13 +444,16 @@ def run_training():
             )
 
             # Show how the model currently thinks.
-            debug_prompt = "hello" if all(ch in stoi for ch in "hello") else text[: min(5, len(text))]
+            debug_prompt = choose_known_prompt("hello")
             debug_next_char(debug_prompt, top_k=8, plot=False)
 
     return steps_seen, train_losses, val_losses
 
 
-def plot_losses(steps_seen, train_losses, val_losses):
+def plot_losses(steps_seen, train_losses, val_losses, enabled: bool = True):
+    if not enabled:
+        return
+
     plt.figure(figsize=(8, 4))
     plt.plot(steps_seen, train_losses, label="train loss")
     plt.plot(steps_seen, val_losses, label="val loss")
@@ -391,7 +465,7 @@ def plot_losses(steps_seen, train_losses, val_losses):
     plt.show()
 
 
-def show_final_examples():
+def show_final_examples(show_plots: bool = True):
     start_char = "h" if "h" in stoi else chars[0]
     context = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=cfg.device)
     generated = model.generate(context, max_new_tokens=200)[0].tolist()
@@ -399,20 +473,61 @@ def show_final_examples():
     print("\n" + "#" * 60)
     print("GENERATED TEXT")
     print("#" * 60)
-    print(decode(generated))
+    print(printable_text(decode(generated)))
 
     if all(ch in stoi for ch in "hello"):
-        debug_next_char("hello", top_k=10, plot=True)
+        debug_next_char("hello", top_k=10, plot=show_plots)
     if all(ch in stoi for ch in "transform"):
-        debug_next_char("transform", top_k=10, plot=True)
+        debug_next_char("transform", top_k=10, plot=show_plots)
     if all(ch in stoi for ch in "hello there."):
-        show_attention("hello there.", layer_index=0, head_index=0)
+        if show_plots:
+            show_attention("hello there.", layer_index=0, head_index=0)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train and inspect a tiny character-level transformer for study."
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Override the number of training steps for short experiments.",
+    )
+    parser.add_argument(
+        "--debug-shapes",
+        action="store_true",
+        help="Print a study-friendly walkthrough of tensor shapes before training.",
+    )
+    parser.add_argument(
+        "--debug-only",
+        action="store_true",
+        help="Run the tensor-shape walkthrough and next-token debug without training.",
+    )
+    parser.add_argument(
+        "--skip-plots",
+        action="store_true",
+        help="Skip matplotlib windows. Useful for quick runs and CI.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    steps_seen, train_losses, val_losses = run_training()
-    plot_losses(steps_seen, train_losses, val_losses)
-    show_final_examples()
+    args = parse_args()
+
+    if args.steps is not None and args.steps < 1:
+        raise ValueError("--steps must be at least 1.")
+
+    if args.debug_only:
+        sanity_check()
+        return
+
+    steps_seen, train_losses, val_losses = run_training(
+        max_steps=args.steps,
+        debug_shapes=args.debug_shapes,
+    )
+    plot_losses(steps_seen, train_losses, val_losses, enabled=not args.skip_plots)
+    show_final_examples(show_plots=not args.skip_plots)
 
 
 if __name__ == "__main__":
