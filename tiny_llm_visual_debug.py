@@ -25,15 +25,15 @@ torch.manual_seed(SEED)
 # ============================================================
 @dataclass
 class Config:
-    batch_size: int = 16
-    block_size: int = 48          # how many characters the model can look at once
-    max_steps: int = 800
+    batch_size: int = 64
+    block_size: int = 64          # how many characters the model can look at once
+    max_steps: int = 2000
     eval_interval: int = 100
     learning_rate: float = 3e-3
 
-    n_embed: int = 64
+    n_embed: int = 128
     n_heads: int = 4
-    n_layers: int = 2
+    n_layers: int = 3
     dropout: float = 0.1
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

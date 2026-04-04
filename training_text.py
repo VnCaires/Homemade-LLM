@@ -1,6 +1,7 @@
 from pathlib import Path
 
 
-CORPUS_PATH = Path(__file__).with_name("training_corpus.txt")
+ROOT = Path(__file__).parent
+TEXT_PATH = ROOT / "training_text.txt"
 
-TRAINING_TEXT = CORPUS_PATH.read_text(encoding="utf-8")
+TRAINING_TEXT = TEXT_PATH.read_text(encoding="utf-8")
