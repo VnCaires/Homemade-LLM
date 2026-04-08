@@ -14,3 +14,4 @@ build/
 training_corpus.txt
 training_corpus_clean.txt
 fusechat_v1_clean_split_2048_filter_wrong.json
+tokenizer_model.json

@@ -1,12 +1,14 @@
 import argparse
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from simple_bpe_tokenizer import SimpleBPETokenizer
 from training_text import TRAINING_TEXT
 
 
@@ -25,16 +27,19 @@ torch.manual_seed(SEED)
 # ============================================================
 @dataclass
 class Config:
-    batch_size: int = 64
-    block_size: int = 64          # how many characters the model can look at once
-    max_steps: int = 2000
-    eval_interval: int = 100
-    learning_rate: float = 3e-3
+    # Larger default config tuned for the current tokenized corpus and RTX 4060-class GPUs.
+    batch_size: int = 32
+    block_size: int = 128         # how many tokens the model can look at once
+    max_steps: int = 4000
+    eval_interval: int = 200
+    learning_rate: float = 1e-3
 
-    n_embed: int = 128
-    n_heads: int = 4
-    n_layers: int = 3
+    n_embed: int = 256
+    n_heads: int = 8
+    n_layers: int = 6
     dropout: float = 0.1
+    tokenizer_vocab_size: int = 1024
+    tokenizer_min_pair_frequency: int = 3
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -43,24 +48,22 @@ cfg = Config()
 
 
 # ============================================================
-# 3. TOKENIZER (character-level)
+# 3. TOKENIZER (byte-level BPE)
 # ============================================================
 text = TRAINING_TEXT
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for ch, i in stoi.items()}
+tokenizer = SimpleBPETokenizer.train_or_load(
+    text,
+    target_vocab_size=cfg.tokenizer_vocab_size,
+    min_pair_frequency=cfg.tokenizer_min_pair_frequency,
+    model_path=Path(__file__).with_name("tokenizer_model.json"),
+)
+vocab_size = tokenizer.vocab_size
 
 def encode(s: str):
-    unknown_chars = sorted(set(s) - set(stoi))
-    if unknown_chars:
-        shown = ", ".join(repr(ch) for ch in unknown_chars)
-        raise ValueError(f"Prompt contains characters outside the training text: {shown}")
-    return [stoi[c] for c in s]
+    return tokenizer.encode(s)
 
 def decode(ids):
-    return "".join(itos[i] for i in ids)
+    return tokenizer.decode(ids)
 
 data = torch.tensor(encode(text), dtype=torch.long)
 
@@ -234,22 +237,35 @@ model = TinyTransformerLM().to(cfg.device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
 
-def choose_known_prompt(preferred: str = "hello"):
-    if preferred and all(ch in stoi for ch in preferred):
+def choose_study_prompt(preferred: str = "Call me"):
+    if preferred and preferred in text:
         return preferred
-    return text[: min(5, len(text))]
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return first_line[: min(20, len(first_line))] if first_line else "The"
+
+
+def choose_demo_prompts():
+    candidates = ["Call me", "the ", "whale", "ship", "sea"]
+    prompts = [candidate for candidate in candidates if candidate in text]
+    return prompts[:3] if prompts else [choose_study_prompt()]
 
 
 def print_tensor_shape(name: str, tensor: torch.Tensor):
     print(f"{name:<28} shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}")
 
 
-def printable_char_list():
-    return [ch.encode("unicode_escape").decode("ascii") for ch in chars]
+def printable_token_preview(max_tokens: int = 40):
+    preview = [tokenizer.token_to_display(token_id) for token_id in range(min(max_tokens, vocab_size))]
+    if vocab_size > max_tokens:
+        preview.append("...")
+    return preview
 
 
-def printable_char(ch: str):
-    return ch.encode("unicode_escape").decode("ascii")
+def printable_token(token_id: int, max_length: int = 16):
+    token_text = tokenizer.token_to_display(token_id)
+    if len(token_text) <= max_length:
+        return token_text
+    return token_text[: max_length - 3] + "..."
 
 
 def printable_text(text_value: str):
@@ -257,7 +273,7 @@ def printable_text(text_value: str):
 
 
 @torch.no_grad()
-def sanity_check(prompt: str = "hello"):
+def sanity_check(prompt: str = "Call me"):
     print("\n" + "=" * 60)
     print("SANITY CHECK: one forward-pass walkthrough")
     print("=" * 60)
@@ -268,6 +284,8 @@ def sanity_check(prompt: str = "hello"):
 
     idx = xb[:1]
     print_tensor_shape("single example idx", idx)
+    sample_tokens = [printable_token(token_id) for token_id in idx[0, : min(12, idx.shape[1])].tolist()]
+    print(f"sample input tokens         {sample_tokens}")
 
     tok_emb = model.token_embedding_table(idx)
     pos_idx = torch.arange(idx.shape[1], device=cfg.device)
@@ -294,9 +312,9 @@ def sanity_check(prompt: str = "hello"):
     if loss is not None:
         print(f"example loss value           {loss.item():.4f}")
 
-    safe_prompt = choose_known_prompt(prompt)
+    safe_prompt = choose_study_prompt(prompt)
     print(f"debug prompt used            {repr(safe_prompt)}")
-    debug_next_char(safe_prompt, top_k=8, plot=False)
+    debug_next_token(safe_prompt, top_k=8, plot=False)
 
 
 # ============================================================
@@ -318,10 +336,10 @@ def estimate_loss():
 
 
 # ============================================================
-# 7. VISUAL DEBUG: NEXT-CHAR PROBABILITIES
+# 7. VISUAL DEBUG: NEXT-TOKEN PROBABILITIES
 # ============================================================
 @torch.no_grad()
-def debug_next_char(prompt: str, top_k: int = 10, plot: bool = True):
+def debug_next_token(prompt: str, top_k: int = 10, plot: bool = True):
     model.eval()
 
     prompt_ids = encode(prompt)
@@ -339,25 +357,23 @@ def debug_next_char(prompt: str, top_k: int = 10, plot: bool = True):
 
     print("\n" + "=" * 60)
     print(f"PROMPT: {repr(prompt)}")
-    print("Top next-character predictions:")
+    print("Top next-token predictions:")
     for rank, (p, i) in enumerate(zip(top_probs.tolist(), top_idx.tolist()), start=1):
-        ch = itos[i]
-        shown = "\\n" if ch == "\n" else printable_char(ch)
-        print(f"{rank:2d}. {repr(shown):>6} -> {p * 100:6.2f}%")
+        shown = printable_token(i)
+        print(f"{rank:2d}. {repr(shown):>12} -> {p * 100:6.2f}%")
     print("=" * 60)
 
     if plot:
         labels = []
         values = []
         for p, i in zip(top_probs.tolist(), top_idx.tolist()):
-            ch = itos[i]
-            labels.append("\\n" if ch == "\n" else printable_char(ch))
+            labels.append(printable_token(i, max_length=10))
             values.append(p * 100)
 
         plt.figure(figsize=(10, 4))
         plt.bar(labels, values)
-        plt.title(f"Next-character probabilities for prompt: {repr(prompt)}")
-        plt.xlabel("Character")
+        plt.title(f"Next-token probabilities for prompt: {repr(prompt)}")
+        plt.xlabel("Token")
         plt.ylabel("Probability (%)")
         plt.tight_layout()
         plt.show()
@@ -382,7 +398,8 @@ def show_attention(prompt: str, layer_index: int = 0, head_index: int = 0):
     if not 0 <= head_index < len(block.sa.heads):
         raise ValueError(f"head_index must be between 0 and {len(block.sa.heads) - 1}.")
 
-    idx = torch.tensor([prompt_ids[-cfg.block_size:]], dtype=torch.long, device=cfg.device)
+    prompt_ids = prompt_ids[-cfg.block_size:]
+    idx = torch.tensor([prompt_ids], dtype=torch.long, device=cfg.device)
     _logits, _ = model(idx)
 
     attn = block.sa.heads[head_index].last_attention  # shape: (B, T, T)
@@ -391,14 +408,14 @@ def show_attention(prompt: str, layer_index: int = 0, head_index: int = 0):
         return
 
     attn = attn[0].numpy()
-    chars_in_prompt = list(prompt[-attn.shape[0]:])
+    token_labels = [printable_token(token_id, max_length=8) for token_id in prompt_ids[-attn.shape[0]:]]
 
     plt.figure(figsize=(8, 6))
     plt.imshow(attn)
     plt.colorbar()
     plt.title(f"Attention heatmap - layer {layer_index}, head {head_index}")
-    plt.xticks(range(len(chars_in_prompt)), chars_in_prompt)
-    plt.yticks(range(len(chars_in_prompt)), chars_in_prompt)
+    plt.xticks(range(len(token_labels)), token_labels, rotation=90)
+    plt.yticks(range(len(token_labels)), token_labels)
     plt.xlabel("Looks at")
     plt.ylabel("Current position")
     plt.tight_layout()
@@ -414,10 +431,14 @@ def run_training(max_steps: int | None = None, debug_shapes: bool = False):
     total_steps = cfg.max_steps if max_steps is None else max_steps
 
     print(f"Device: {cfg.device}")
+    print("Tokenizer: byte-level BPE")
+    print(f"Tokenizer vocab size: {vocab_size}")
+    print(f"Tokenizer merges: {tokenizer.num_merges}")
+    print(f"Token preview: {printable_token_preview()}")
     print(f"Vocabulary size: {vocab_size}")
-    print(f"Characters: {printable_char_list()}")
     print(f"Using block size: {cfg.block_size}")
     print(f"Train tokens: {len(train_data)} | Val tokens: {len(val_data)}")
+    print(f"Corpus characters: {len(text)} | Corpus tokens: {len(data)}")
     print(f"Training steps: {total_steps}")
 
     if debug_shapes:
@@ -444,8 +465,8 @@ def run_training(max_steps: int | None = None, debug_shapes: bool = False):
             )
 
             # Show how the model currently thinks.
-            debug_prompt = choose_known_prompt("hello")
-            debug_next_char(debug_prompt, top_k=8, plot=False)
+            debug_prompt = choose_study_prompt("Call me")
+            debug_next_token(debug_prompt, top_k=8, plot=False)
 
     return steps_seen, train_losses, val_losses
 
@@ -466,27 +487,25 @@ def plot_losses(steps_seen, train_losses, val_losses, enabled: bool = True):
 
 
 def show_final_examples(show_plots: bool = True):
-    start_char = "h" if "h" in stoi else chars[0]
-    context = torch.tensor([[stoi[start_char]]], dtype=torch.long, device=cfg.device)
+    start_prompt = choose_study_prompt("Call me")
+    context = torch.tensor([encode(start_prompt)], dtype=torch.long, device=cfg.device)
     generated = model.generate(context, max_new_tokens=200)[0].tolist()
 
     print("\n" + "#" * 60)
     print("GENERATED TEXT")
     print("#" * 60)
+    print(f"Seed prompt: {repr(start_prompt)}")
     print(printable_text(decode(generated)))
 
-    if all(ch in stoi for ch in "hello"):
-        debug_next_char("hello", top_k=10, plot=show_plots)
-    if all(ch in stoi for ch in "transform"):
-        debug_next_char("transform", top_k=10, plot=show_plots)
-    if all(ch in stoi for ch in "hello there."):
-        if show_plots:
-            show_attention("hello there.", layer_index=0, head_index=0)
+    for prompt in choose_demo_prompts():
+        debug_next_token(prompt, top_k=10, plot=show_plots)
+    if show_plots:
+        show_attention(start_prompt, layer_index=0, head_index=0)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train and inspect a tiny character-level transformer for study."
+        description="Train and inspect a tiny token-level transformer for study."
     )
     parser.add_argument(
         "--steps",

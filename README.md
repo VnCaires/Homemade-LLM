@@ -2,7 +2,7 @@
 
 A small transformer-based language model built for learning and experimentation.
 
-This project is intentionally simple, slow, and readable so you can study how a tiny transformer is trained, how it predicts the next character, and how its internal tensors evolve during a forward pass.
+This project is intentionally simple, slow, and readable so you can study how a tiny transformer is trained, how it predicts the next token, and how its internal tensors evolve during a forward pass.
 
 ## Purpose
 
@@ -13,7 +13,7 @@ Instead of hiding the logic behind a large framework, it keeps the main pieces v
 - batching
 - self-attention
 - training loss
-- next-character probabilities
+- next-token probabilities
 - attention visualization
 
 ## Setup
@@ -62,11 +62,13 @@ python tiny_llm_visual_debug.py --debug-only
 ## Files
 
 - `tiny_llm_visual_debug.py`: main model, training loop, and debug tools
+- `simple_bpe_tokenizer.py`: local byte-level BPE tokenizer used to build token ids
 - `training_text.py`: the text corpus used for training
 - `STUDY_NOTES.md`: a place to write your own explanations while learning
 
 ## Notes
 
-- The model is character-level, so it can only predict characters that already exist in the training text.
+- The model now uses a local byte-level BPE tokenizer, which is more efficient than pure character-level training while still being small enough to study.
 - The code is intentionally not optimized for performance. Readability comes first.
 - `requirements-cpu.txt` is for CPU-only installs, and `requirements-cuda.txt` is for NVIDIA CUDA installs.
+- A cached tokenizer model is written to `tokenizer_model.json` and automatically rebuilt when the training text changes.
