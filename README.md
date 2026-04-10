@@ -46,6 +46,18 @@ Short study run:
 python tiny_llm_visual_debug.py --steps 2 --debug-shapes --skip-plots
 ```
 
+Train and save a checkpoint:
+
+```powershell
+python tiny_llm_visual_debug.py --steps 1000 --checkpoint-path checkpoints\study.pt
+```
+
+Resume from that checkpoint:
+
+```powershell
+python tiny_llm_visual_debug.py --resume --steps 1000 --checkpoint-path checkpoints\study.pt
+```
+
 Shape walkthrough only:
 
 ```powershell
@@ -65,6 +77,7 @@ python tiny_llm_visual_debug.py --debug-only
 - `simple_bpe_tokenizer.py`: local byte-level BPE tokenizer used to build token ids
 - `training_text.py`: the text corpus used for training
 - `STUDY_NOTES.md`: a place to write your own explanations while learning
+- `checkpoints/`: local training checkpoints created when you run or resume training
 
 ## Notes
 
@@ -72,3 +85,4 @@ python tiny_llm_visual_debug.py --debug-only
 - The code is intentionally not optimized for performance. Readability comes first.
 - `requirements-cpu.txt` is for CPU-only installs, and `requirements-cuda.txt` is for NVIDIA CUDA installs.
 - A cached tokenizer model is written to `tokenizer_model.json` and automatically rebuilt when the training text changes.
+- Checkpoints store the model state, optimizer state, loss history, and RNG state so a resumed run can continue from the same training trajectory.

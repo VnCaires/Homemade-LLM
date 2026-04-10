@@ -1,6 +1,7 @@
 import argparse
+import hashlib
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -45,6 +46,7 @@ class Config:
 
 
 cfg = Config()
+CHECKPOINT_PATH = Path(__file__).with_name("checkpoints") / "latest.pt"
 
 
 # ============================================================
@@ -66,6 +68,7 @@ def decode(ids):
     return tokenizer.decode(ids)
 
 data = torch.tensor(encode(text), dtype=torch.long)
+TEXT_HASH = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def prepare_splits(full_data: torch.Tensor):
@@ -235,6 +238,72 @@ class TinyTransformerLM(nn.Module):
 
 model = TinyTransformerLM().to(cfg.device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
+
+
+def capture_rng_state():
+    state = {
+        "python_random_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+
+    def to_byte_tensor(rng_state):
+        if isinstance(rng_state, torch.Tensor):
+            return rng_state.detach().to(device="cpu", dtype=torch.uint8)
+        return torch.tensor(rng_state, dtype=torch.uint8)
+
+    if "python_random_state" in state:
+        random.setstate(state["python_random_state"])
+    if "torch_rng_state" in state:
+        torch.set_rng_state(to_byte_tensor(state["torch_rng_state"]))
+    if torch.cuda.is_available() and "cuda_rng_state_all" in state:
+        torch.cuda.set_rng_state_all([to_byte_tensor(rng_state) for rng_state in state["cuda_rng_state_all"]])
+
+
+def checkpoint_payload(step, steps_seen, train_losses, val_losses):
+    return {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "steps_seen": steps_seen,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "config": asdict(cfg),
+        "text_hash": TEXT_HASH,
+        "tokenizer_vocab_size": vocab_size,
+        "tokenizer_num_merges": tokenizer.num_merges,
+        "corpus_characters": len(text),
+        "corpus_tokens": len(data),
+        "rng_state": capture_rng_state(),
+    }
+
+
+def save_checkpoint(path: Path, step, steps_seen, train_losses, val_losses):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint_payload(step, steps_seen, train_losses, val_losses), path)
+    print(f"Checkpoint saved to {path}")
+
+
+def load_checkpoint(path: Path):
+    checkpoint = torch.load(path, map_location=cfg.device, weights_only=False)
+    if checkpoint.get("text_hash") != TEXT_HASH:
+        raise ValueError(
+            "Checkpoint text hash does not match the current training_text.txt. "
+            "Use the same training text when resuming."
+        )
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    restore_rng_state(checkpoint.get("rng_state"))
+    print(f"Resumed checkpoint from {path} at step {checkpoint['step']}")
+    return checkpoint
 
 
 def choose_study_prompt(preferred: str = "Call me"):
@@ -424,11 +493,27 @@ def show_attention(prompt: str, layer_index: int = 0, head_index: int = 0):
     model.train()
 
 
-def run_training(max_steps: int | None = None, debug_shapes: bool = False):
+def run_training(
+    max_steps: int | None = None,
+    debug_shapes: bool = False,
+    checkpoint_path: Path = CHECKPOINT_PATH,
+    resume: bool = False,
+    save_every: int = 0,
+):
     train_losses = []
     val_losses = []
     steps_seen = []
     total_steps = cfg.max_steps if max_steps is None else max_steps
+    starting_step = 0
+
+    if resume:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoint = load_checkpoint(checkpoint_path)
+        starting_step = checkpoint["step"]
+        steps_seen = list(checkpoint.get("steps_seen", []))
+        train_losses = list(checkpoint.get("train_losses", []))
+        val_losses = list(checkpoint.get("val_losses", []))
 
     print(f"Device: {cfg.device}")
     print("Tokenizer: byte-level BPE")
@@ -439,12 +524,15 @@ def run_training(max_steps: int | None = None, debug_shapes: bool = False):
     print(f"Using block size: {cfg.block_size}")
     print(f"Train tokens: {len(train_data)} | Val tokens: {len(val_data)}")
     print(f"Corpus characters: {len(text)} | Corpus tokens: {len(data)}")
-    print(f"Training steps: {total_steps}")
+    print(f"Training steps this run: {total_steps}")
+    print(f"Starting global step: {starting_step}")
+    print(f"Checkpoint path: {checkpoint_path}")
 
     if debug_shapes:
         sanity_check()
 
-    for step in range(total_steps):
+    for local_step in range(total_steps):
+        global_step = starting_step + local_step
         xb, yb = get_batch("train")
         logits, loss = model(xb, yb)
 
@@ -452,14 +540,19 @@ def run_training(max_steps: int | None = None, debug_shapes: bool = False):
         loss.backward()
         optimizer.step()
 
-        if step % cfg.eval_interval == 0 or step == total_steps - 1:
+        completed_step = global_step + 1
+
+        if save_every > 0 and completed_step % save_every == 0:
+            save_checkpoint(checkpoint_path, completed_step, steps_seen, train_losses, val_losses)
+
+        if global_step % cfg.eval_interval == 0 or local_step == total_steps - 1:
             losses = estimate_loss()
-            steps_seen.append(step)
+            steps_seen.append(global_step)
             train_losses.append(losses["train"])
             val_losses.append(losses["val"])
 
             print(
-                f"step {step:4d} | "
+                f"step {global_step:4d} | "
                 f"train loss {losses['train']:.4f} | "
                 f"val loss {losses['val']:.4f}"
             )
@@ -468,6 +561,8 @@ def run_training(max_steps: int | None = None, debug_shapes: bool = False):
             debug_prompt = choose_study_prompt("Call me")
             debug_next_token(debug_prompt, top_k=8, plot=False)
 
+    final_step = starting_step + total_steps
+    save_checkpoint(checkpoint_path, final_step, steps_seen, train_losses, val_losses)
     return steps_seen, train_losses, val_losses
 
 
@@ -528,6 +623,23 @@ def parse_args():
         action="store_true",
         help="Skip matplotlib windows. Useful for quick runs and CI.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the checkpoint file instead of starting from scratch.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=CHECKPOINT_PATH,
+        help="Where to save or load the training checkpoint.",
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=0,
+        help="Save an extra checkpoint every N optimizer steps. 0 disables periodic saves.",
+    )
     return parser.parse_args()
 
 
@@ -536,6 +648,8 @@ def main():
 
     if args.steps is not None and args.steps < 1:
         raise ValueError("--steps must be at least 1.")
+    if args.save_every < 0:
+        raise ValueError("--save-every cannot be negative.")
 
     if args.debug_only:
         sanity_check()
@@ -544,6 +658,9 @@ def main():
     steps_seen, train_losses, val_losses = run_training(
         max_steps=args.steps,
         debug_shapes=args.debug_shapes,
+        checkpoint_path=args.checkpoint_path,
+        resume=args.resume,
+        save_every=args.save_every,
     )
     plot_losses(steps_seen, train_losses, val_losses, enabled=not args.skip_plots)
     show_final_examples(show_plots=not args.skip_plots)
