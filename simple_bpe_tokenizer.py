@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import argparse
 from collections import Counter
 from pathlib import Path
 
@@ -10,6 +11,10 @@ PIECE_PATTERN = re.compile(r"\s+\w+|\w+|\s+[^\w\s]+|[^\w\s]+|\s+", re.UNICODE)
 
 def split_text_into_pieces(text: str):
     return PIECE_PATTERN.findall(text)
+
+
+def text_to_display(text_value: str):
+    return text_value.encode("unicode_escape").decode("ascii")
 
 
 def merge_token_sequence(token_sequence, pair, new_token_id):
@@ -143,3 +148,121 @@ class SimpleBPETokenizer:
 
     def token_to_display(self, token_id: int):
         return self.token_to_text(token_id).encode("unicode_escape").decode("ascii")
+
+    def token_to_short_display(self, token_id: int, max_length: int = 16):
+        token_text = self.token_to_display(token_id)
+        if len(token_text) <= max_length:
+            return token_text
+        return token_text[: max_length - 3] + "..."
+
+    def format_tokenization_report(
+        self,
+        text: str,
+        max_pieces: int = 12,
+        max_tokens_per_piece: int = 8,
+        max_prompt_tokens: int = 32,
+        token_display_length: int = 16,
+    ):
+        prompt_ids = self.encode(text)
+        pieces = split_text_into_pieces(text)
+        if not pieces:
+            return ["Prompt tokenization: []"]
+
+        lines = ["Prompt tokenization:"]
+        for piece_index, piece in enumerate(pieces[:max_pieces], start=1):
+            piece_ids = self.encode(piece)
+            shown_piece_ids = piece_ids[:max_tokens_per_piece]
+            shown_tokens = [
+                self.token_to_short_display(token_id, max_length=token_display_length)
+                for token_id in shown_piece_ids
+            ]
+            piece_id_suffix = " ..." if len(piece_ids) > max_tokens_per_piece else ""
+            token_suffix = ["..."] if len(piece_ids) > max_tokens_per_piece else []
+            lines.append(
+                f" {piece_index:2d}. {repr(text_to_display(piece)):<18}"
+                f" -> ids {shown_piece_ids}{piece_id_suffix}"
+                f" -> tokens {shown_tokens + token_suffix}"
+            )
+
+        if len(pieces) > max_pieces:
+            lines.append(f" ... {len(pieces) - max_pieces} more text pieces omitted")
+
+        shown_prompt_ids = prompt_ids[:max_prompt_tokens]
+        prompt_id_suffix = " ..." if len(prompt_ids) > max_prompt_tokens else ""
+        lines.append(f"Full prompt token ids: {shown_prompt_ids}{prompt_id_suffix}")
+        return lines
+
+    def print_tokenization_report(
+        self,
+        text: str,
+        max_pieces: int = 12,
+        max_tokens_per_piece: int = 8,
+        max_prompt_tokens: int = 32,
+        token_display_length: int = 16,
+    ):
+        for line in self.format_tokenization_report(
+            text,
+            max_pieces=max_pieces,
+            max_tokens_per_piece=max_tokens_per_piece,
+            max_prompt_tokens=max_prompt_tokens,
+            token_display_length=token_display_length,
+        ):
+            print(line)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train or load the local byte-level BPE tokenizer and show how a prompt becomes tokens."
+    )
+    parser.add_argument(
+        "--text-path",
+        type=Path,
+        default=Path(__file__).with_name("training_text.txt"),
+        help="Corpus used to train or load the tokenizer.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=Path(__file__).with_name("tokenizer_model.json"),
+        help="Where to save or load the tokenizer model.",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="Call me",
+        help="Prompt to tokenize for the study output.",
+    )
+    parser.add_argument(
+        "--target-vocab-size",
+        type=int,
+        default=1024,
+        help="Target tokenizer vocabulary size.",
+    )
+    parser.add_argument(
+        "--min-pair-frequency",
+        type=int,
+        default=3,
+        help="Minimum pair frequency required to create a merge.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    corpus_text = args.text_path.read_text(encoding="utf-8")
+    tokenizer = SimpleBPETokenizer.train_or_load(
+        corpus_text,
+        target_vocab_size=args.target_vocab_size,
+        min_pair_frequency=args.min_pair_frequency,
+        model_path=args.model_path,
+    )
+
+    print(f"Corpus path: {args.text_path}")
+    print(f"Model path: {args.model_path}")
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
+    print(f"Tokenizer merges: {tokenizer.num_merges}")
+    print(f"Prompt: {repr(args.prompt)}")
+    tokenizer.print_tokenization_report(args.prompt)
+
+
+if __name__ == "__main__":
+    main()

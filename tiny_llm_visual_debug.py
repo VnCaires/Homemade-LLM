@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from simple_bpe_tokenizer import SimpleBPETokenizer
+from simple_bpe_tokenizer import SimpleBPETokenizer, text_to_display
 from training_text import TRAINING_TEXT
 
 
@@ -331,14 +331,11 @@ def printable_token_preview(max_tokens: int = 40):
 
 
 def printable_token(token_id: int, max_length: int = 16):
-    token_text = tokenizer.token_to_display(token_id)
-    if len(token_text) <= max_length:
-        return token_text
-    return token_text[: max_length - 3] + "..."
+    return tokenizer.token_to_short_display(token_id, max_length=max_length)
 
 
 def printable_text(text_value: str):
-    return text_value.encode("unicode_escape").decode("ascii")
+    return text_to_display(text_value)
 
 
 @torch.no_grad()
@@ -426,6 +423,7 @@ def debug_next_token(prompt: str, top_k: int = 10, plot: bool = True):
 
     print("\n" + "=" * 60)
     print(f"PROMPT: {repr(prompt)}")
+    tokenizer.print_tokenization_report(prompt)
     print("Top next-token predictions:")
     for rank, (p, i) in enumerate(zip(top_probs.tolist(), top_idx.tolist()), start=1):
         shown = printable_token(i)
