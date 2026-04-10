@@ -59,7 +59,7 @@ Resume from that checkpoint:
 python tiny_llm_visual_debug.py --resume --steps 1000 --checkpoint-path checkpoints\study.pt
 ```
 
-Shape walkthrough only:
+Debug walkthrough only:
 
 ```powershell
 python tiny_llm_visual_debug.py --debug-only
@@ -75,7 +75,7 @@ python simple_bpe_tokenizer.py --prompt "Call me"
 
 ## Study Flow
 
-1. Edit `training_text.py` to choose a tiny training corpus.
+1. Edit `training_text.txt` to choose the training corpus.
 2. Run `--debug-only` to inspect tensor shapes before training.
 3. Run `--steps 2 --debug-shapes --skip-plots` for a very short training pass with live prompt tokenization and next-token predictions at each evaluation point.
 4. Run the full script when you want to watch learning and plots over time.
@@ -84,7 +84,8 @@ python simple_bpe_tokenizer.py --prompt "Call me"
 
 - `tiny_llm_visual_debug.py`: main model, training loop, and debug tools
 - `simple_bpe_tokenizer.py`: local byte-level BPE tokenizer used to build token ids and print a prompt-to-token walkthrough
-- `training_text.py`: the text corpus used for training
+- `training_text.txt`: the training text used for the corpus
+- `training_text.py`: tiny loader that reads `training_text.txt`
 - `STUDY_NOTES.md`: a place to write your own explanations while learning
 - `checkpoints/`: local training checkpoints created when you run or resume training
 

@@ -16,7 +16,7 @@ from training_text import TRAINING_TEXT
 # ============================================================
 # 1. YOUR TRAINING TEXT
 # ============================================================
-# Edit `training_text.py` to change the corpus used by the model.
+# Edit `training_text.txt` to change the corpus used by the model.
 
 SEED = 42
 random.seed(SEED)
