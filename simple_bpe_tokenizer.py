@@ -209,6 +209,25 @@ class SimpleBPETokenizer:
         ):
             print(line)
 
+    def format_vocabulary_report(self):
+        lines = [
+            f"# Vocabulary size: {self.vocab_size}",
+            f"# Base tokens: {self.base_vocab_size}",
+            f"# Merged tokens: {self.num_merges}",
+            "",
+        ]
+        for token_id in range(self.vocab_size):
+            token_kind = "base" if token_id < self.base_vocab_size else "merged"
+            token_text = self.token_to_display(token_id)
+            lines.append(f"{token_id}\t{token_kind}\t{repr(token_text)}")
+        return lines
+
+    def export_vocabulary(self, output_path: Path):
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(self.format_vocabulary_report()) + "\n", encoding="utf-8")
+        print(f"Exported vocabulary to {output_path}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -243,6 +262,12 @@ def parse_args():
         default=3,
         help="Minimum pair frequency required to create a merge.",
     )
+    parser.add_argument(
+        "--export-vocab-path",
+        type=Path,
+        default=None,
+        help="Optional path to save every token in the vocabulary to a text file.",
+    )
     return parser.parse_args()
 
 
@@ -262,6 +287,8 @@ def main():
     print(f"Tokenizer merges: {tokenizer.num_merges}")
     print(f"Prompt: {repr(args.prompt)}")
     tokenizer.print_tokenization_report(args.prompt)
+    if args.export_vocab_path is not None:
+        tokenizer.export_vocabulary(args.export_vocab_path)
 
 
 if __name__ == "__main__":

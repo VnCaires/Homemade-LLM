@@ -16,3 +16,5 @@ training_corpus_clean.txt
 fusechat_v1_clean_split_2048_filter_wrong.json
 tokenizer_model.json
 checkpoints/
+all_tokens.txt
+exported_tokens.txt

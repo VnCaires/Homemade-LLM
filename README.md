@@ -73,6 +73,12 @@ Tokenizer walkthrough only:
 python simple_bpe_tokenizer.py --prompt "Call me"
 ```
 
+Export the full tokenizer vocabulary to a file:
+
+```powershell
+python simple_bpe_tokenizer.py --export-vocab-path all_tokens.txt
+```
+
 ## Study Flow
 
 1. Edit `training_text.txt` to choose the training corpus.
